@@ -1,0 +1,22 @@
+# Environments
+.venv/
+.env
+__pycache__/
+
+# Node
+node_modules/
+.next/
+build/
+dist/
+
+# Editor
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Databases
+*.sqlite3
+*.db
