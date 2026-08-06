@@ -35,10 +35,37 @@ export default function AssistantPage() {
       }
 
       const data = await res.json();
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+      let replyText = data.reply;
       
-      // Save the latest recommendation for the Smart Mirror
-      localStorage.setItem("latestRecommendation", data.reply);
+      // Parse RECOMMENDED tags
+      const extractStyles = (text: string, tag: string, storageKey: string) => {
+        const match = text.match(new RegExp(`${tag}=\\[(.*?)\\]`));
+        if (match) {
+          try {
+            const stylesString = `[${match[1]}]`.replace(/'/g, '"');
+            const styles = JSON.parse(stylesString);
+            if (Array.isArray(styles)) {
+              localStorage.setItem(storageKey, JSON.stringify(styles));
+            }
+          } catch(e) {
+            console.error(`Failed to parse ${tag}`, e);
+          }
+        }
+      };
+
+      extractStyles(replyText, "RECOMMENDED_HAIR", "recommendedHair");
+      extractStyles(replyText, "RECOMMENDED_BEARDS", "recommendedBeards");
+      extractStyles(replyText, "RECOMMENDED_FASHION", "recommendedFashion");
+
+      // Remove the secret tags from the UI message
+      replyText = replyText.replace(/RECOMMENDED_HAIR=\[.*?\]/g, '').trim();
+      replyText = replyText.replace(/RECOMMENDED_BEARDS=\[.*?\]/g, '').trim();
+      replyText = replyText.replace(/RECOMMENDED_FASHION=\[.*?\]/g, '').trim();
+
+      setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+      
+      // Save the latest recommendation text for the Smart Mirror
+      localStorage.setItem("latestRecommendation", replyText);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
       setError(message);

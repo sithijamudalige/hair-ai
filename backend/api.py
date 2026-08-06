@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 
 # Ensure .env is loaded and overrides any old terminal variables
 if os.path.exists(".env"):
@@ -12,7 +13,8 @@ if os.path.exists(".env"):
 
 import urllib.request
 import urllib.error
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Body
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List
 import numpy as np
@@ -153,8 +155,12 @@ def analyze_bgr(bgr: np.ndarray):
         # Predict skin type
         skin_label, skin_conf = predict_pil(skin_model, SKIN_CLASSES, bgr_to_pil_rgb(face_crop))
 
+        raw_pose = getattr(f, 'pose', None)
+        pose_list = [float(x) for x in raw_pose] if raw_pose is not None else [0.0, 0.0, 0.0]
+
         out.append({
             "bbox": [float(x) for x in f.bbox],
+            "pose": pose_list,
             "det_score": float(f.det_score),
             "face_type": {"label": face_label, "confidence": face_conf},
             "hair_type": {"label": hair_label, "confidence": hair_conf},
@@ -205,17 +211,36 @@ class HairAssistantRequest(BaseModel):
     messages: List[ChatMessagePayload] = []
 
 
-HAIR_ASSISTANT_SYSTEM_PROMPT = """You are Aura Hair Assistant, a friendly expert barber and stylist AI.
+HAIR_ASSISTANT_SYSTEM_PROMPT = """You are a professional barber, grooming expert, and fashion stylist AI assistant.
+Your goal is to converse with the user, understand their face shape, skin tone, hair type, and style preferences.
+Based on their profile, you MUST provide a complete look recommendation that includes:
+1. The best hairstyles for them.
+2. Complementary beard or facial hair styles.
+3. Fashion and clothing tips (colors and styles) that match their look and skin tone.
 
-The user completed a face, skin, and hair analysis. Use their confirmed profile to recommend:
-- Haircut styles that suit their face shape
-- Beard styles (or clean-shaven advice) if relevant
-- Styling tips, maintenance, and products
-- Color or treatment suggestions when appropriate
+Be extremely brief, conversational, and direct. Break your advice into short, easy-to-read sections.
 
-Be specific, practical, and encouraging. Format recommendations clearly with headings and bullet points.
-If information is missing, make reasonable suggestions and mention what you assumed.
-Always personalize advice to their face type, skin tone, and hair type."""
+CRITICAL REQUIREMENT:
+At the very end of your response, you MUST output 3 secret machine-readable tags containing EXACTLY 3 recommendations each from the following strict lists:
+AVAILABLE HAIR STYLES: "fade", "buzz_cut", "dreads", "wavy", "pompadour", "mullet", "comb_over", "spiky", "fringe", "long_hair"
+AVAILABLE BEARD STYLES: "clean_shaven", "stubble", "goatee", "short_boxed", "full_beard", "faded_beard", "ducktail", "anchor", "mustache"
+AVAILABLE FASHION STYLES: "smart_casual", "streetwear", "business_professional", "athleisure", "minimalist", "vintage", "grunge", "preppy"
+
+You must use this exact format on new lines:
+RECOMMENDED_HAIR=["style1", "style2", "style3"]
+RECOMMENDED_BEARDS=["style1", "style2", "style3"]
+RECOMMENDED_FASHION=["style1", "style2", "style3"]
+
+Example response:
+Based on your oval face and skin tone, here is your complete look:
+Hair: I'd recommend a tight fade or some textured waves.
+Beard: A short boxed beard will sharpen your jawline perfectly.
+Fashion: Earth tones like olive green and navy blue will look incredible on you. Go for smart-casual layers.
+
+RECOMMENDED_HAIR=["fade", "wavy", "buzz_cut"]
+RECOMMENDED_BEARDS=["short_boxed", "faded_beard", "stubble"]
+RECOMMENDED_FASHION=["smart_casual", "minimalist", "streetwear"]
+"""
 
 
 def build_profile_context(profile: UserProfilePayload) -> str:
@@ -297,7 +322,197 @@ async def hair_assistant(req: HairAssistantRequest):
     return {"reply": reply}
 
 
+
+GEMINI_VISION_PROMPT = """You are a professional barber and hairstylist AI. Analyze this person's face photo carefully.
+
+Look at their:
+- Face shape (oval, round, square, heart, oblong)
+- Current hair (length, texture, thickness)
+- Facial hair / beard
+- Overall style vibe
+
+Give a SHORT, friendly, personalized recommendation (3-4 sentences max).
+
+CRITICAL: At the very end, output EXACTLY 3 recommended hairstyles from this strict list:
+AVAILABLE STYLES: "fade", "buzz_cut", "dreads", "wavy", "pompadour", "mullet", "comb_over", "spiky", "fringe", "long_hair"
+
+Use this EXACT format on a new line:
+RECOMMENDED_STYLES=["style1", "style2", "style3"]
+"""
+
+# Initialize global pipe for offline generation
+local_pipe = None
+
+class FaceSwapRequest(BaseModel):
+    source_image: str  # Base64 string of the user's face
+
+
+class GeminiGenerateRequest(BaseModel):
+    image_base64: str
+    style_name: str
+    category: str = "hair"
+
+
+@app.post("/generate-hairstyle")
+async def generate_hairstyle(req: GeminiGenerateRequest):
+    api_key = os.getenv("HUGGINGFACE_API_KEY", "")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Hugging Face API Key is required in .env")
+
+    img_data = req.image_base64
+    if "," in img_data:
+        img_data = img_data.split(",", 1)[1]
+
+    try:
+        # Save input image to a temporary file for Gradio
+        temp_input_path = "temp_input.jpg"
+        with open(temp_input_path, "wb") as f:
+            f.write(base64.b64decode(img_data))
+        
+        try:
+            # We are doing 100% offline generation using diffusers
+            import torch
+            from diffusers import AutoPipelineForImage2Image
+            from PIL import Image
+            
+            # Use a global pipeline to avoid reloading on every request
+            global local_pipe
+            if 'local_pipe' not in globals() or local_pipe is None:
+                print("Loading LCM AI model (this may take a few minutes the first time to download)...")
+                # LCM Dreamshaper v7 is amazing for fast 4-step generation and perfect for low-strength image2image
+                model_id = "SimianLuo/LCM_Dreamshaper_v7"
+                
+                # Check for GPU, fallback to CPU
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                
+                local_pipe = AutoPipelineForImage2Image.from_pretrained(
+                    model_id, torch_dtype=dtype, safety_checker=None
+                )
+                local_pipe.to(device)
+                print("Model loaded successfully!")
+            
+            # Load the input image
+            init_image = Image.open(temp_input_path).convert("RGB")
+            # Resize image to save memory and speed up CPU generation
+            init_image.thumbnail((512, 512))
+            
+            # Remove background for better quality editing
+            try:
+                from rembg import remove
+                print("Removing background using rembg...")
+                no_bg_image = remove(init_image)
+                # Create a solid white background
+                clean_image = Image.new("RGB", no_bg_image.size, (255, 255, 255))
+                # Paste the subject using the alpha channel as a mask
+                if no_bg_image.mode == "RGBA":
+                    clean_image.paste(no_bg_image, mask=no_bg_image.split()[3])
+                else:
+                    clean_image = no_bg_image.convert("RGB")
+                init_image = clean_image
+                print("Background removed successfully.")
+            except Exception as e:
+                print(f"Failed to remove background: {e}")
+            
+            # Generate prompt based on category
+            if req.category == "hair":
+                prompt = f"a short {req.style_name.replace('_', ' ')} haircut"
+            elif req.category == "beard":
+                prompt = f"a man with a highly detailed {req.style_name.replace('_', ' ')} beard on his face"
+            elif req.category == "fashion":
+                prompt = f"a man wearing {req.style_name.replace('_', ' ')} clothing, highly detailed fashion"
+            else:
+                prompt = f"a short {req.style_name.replace('_', ' ')} haircut"
+                
+            print(f"Generating offline image for prompt: {prompt} (Category: {req.category})")
+            
+            # Generate! Use LCM (4 steps) and low strength (0.35) to perfectly preserve the face and skin color!
+            output_image = local_pipe(
+                prompt=prompt,
+                image=init_image,
+                num_inference_steps=4,
+                guidance_scale=8.0,
+                strength=0.35,
+            ).images[0]
+            
+            # ULTIMATE FIX: Force 100% face preservation by pasting the original face back onto the generated image!
+            try:
+                import cv2
+                import numpy as np
+                print("Restoring exact original face pixels...")
+                
+                # Convert images to CV2 format
+                orig_cv = cv2.cvtColor(np.array(init_image), cv2.COLOR_RGB2BGR)
+                gen_cv = cv2.cvtColor(np.array(output_image), cv2.COLOR_RGB2BGR)
+                
+                # Detect face in the original image
+                faces = face_app.get(orig_cv)
+                if faces:
+                    # Get the largest face
+                    faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
+                    f = faces[0]
+                    x1, y1, x2, y2 = [int(v) for v in f.bbox]
+                    h, w = orig_cv.shape[:2]
+                    
+                    # Create a mask specifically for the inner face (eyes, nose, mouth, cheeks)
+                    mask = np.zeros((h, w), dtype=np.uint8)
+                    center_x = (x1 + x2) // 2
+                    
+                    if req.category in ["hair", "fashion"]:
+                        # Restore full face
+                        center_y = int(y1 + (y2 - y1) * 0.55) 
+                        axes = (int((x2 - x1) * 0.38), int((y2 - y1) * 0.45))
+                    else:
+                        # For beard, ONLY restore the upper face (eyes/forehead) so we don't overwrite the generated beard!
+                        center_y = int(y1 + (y2 - y1) * 0.35) 
+                        axes = (int((x2 - x1) * 0.38), int((y2 - y1) * 0.25))
+                        
+                    cv2.ellipse(mask, (center_x, center_y), axes, 0, 0, 360, 255, -1)
+                    
+                    # Heavily blur the mask for seamless, invisible blending
+                    mask = cv2.GaussianBlur(mask, (41, 41), 0)
+                    mask_3d = mask[:, :, None] / 255.0
+                    
+                    # Blend the original exact face onto the generated image
+                    blended = (orig_cv * mask_3d + gen_cv * (1 - mask_3d)).astype(np.uint8)
+                    output_image = Image.fromarray(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB))
+                    print("Face completely restored!")
+                else:
+                    print("No face detected for restoration.")
+            except Exception as e:
+                print(f"Failed to restore face: {e}")
+            
+            # Save the generated image
+            output_image_path = "temp_output.jpg"
+            output_image.save(output_image_path, "JPEG")
+            
+            # Read the generated image and convert to base64
+            with open(output_image_path, "rb") as img_file:
+                encoded_string = base64.b64encode(img_file.read()).decode('utf-8')
+                final_data_uri = f"data:image/jpeg;base64,{encoded_string}"
+                
+            if os.path.exists(output_image_path):
+                os.remove(output_image_path)
+                
+        except Exception as e:
+            print(f"Offline Image Edit Failed: {e}")
+            # Fallback to returning the original image so the app doesn't crash
+            final_data_uri = req.image_base64
+            
+        # Cleanup temp file
+        if os.path.exists(temp_input_path):
+            os.remove(temp_input_path)
+            
+        return {"image_url": final_data_uri}
+
+    except Exception as e:
+        print(f"Hugging Face Image Edit Failed: {e}")
+        # Force reload trigger
+        raise HTTPException(status_code=502, detail=f"Failed to edit image via Hugging Face AI: {e}") from e
+
+
 if __name__ == "__main__":
     import uvicorn
+    import base64
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
