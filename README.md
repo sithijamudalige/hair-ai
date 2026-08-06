@@ -50,13 +50,16 @@ We need to create an isolated Python environment and install the AI/Machine Lear
    pip install -r requirements.txt
    ```
 
-5. **Set up the API Key (CRITICAL)**:
-   The backend uses Groq AI for the smart assistant. You must configure the API key.
+5. **Set up the API Keys (CRITICAL)**:
+   The backend uses Groq AI for the smart assistant, and Hugging Face for offline image generation. You must configure both API keys.
    - Create a file named `.env` inside the `backend` folder.
-   - Add the following line to the file (replace with your actual Groq API key which starts with `gsk_`):
+   - Add the following lines to the file (replace with your actual API keys):
      ```env
      GROQ_API_KEY=gsk_your_api_key_here
+     HUGGINGFACE_API_KEY=hf_your_api_key_here
      ```
+
+   *(Note: The first time you generate a Hair/Beard/Fashion style in the Smart Mirror, the backend will download the AI generation models. This is a one-time download and may take 2-5 minutes depending on your internet connection.)*
 
 6. **Go back to the main folder**:
    ```bash

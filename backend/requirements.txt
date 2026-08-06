@@ -9,3 +9,7 @@ pillow
 onnxruntime
 insightface
 python-multipart
+diffusers
+transformers
+accelerate
+rembg
